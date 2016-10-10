@@ -146,7 +146,6 @@ void stop_trace_timer()
     struct itimerval sTimerValue;
     struct itimerval sOldTimerValue;
     memset(&sTimerValue, 0, sizeof(sTimerValue));
-    g_sample_interval = 0;
     setitimer(ITIMER_PROF, &sTimerValue, &sOldTimerValue);
 }
 
