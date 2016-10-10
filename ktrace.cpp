@@ -71,6 +71,7 @@ void mySigAction(int iSignal, siginfo_t *psSigInfo, void* pvContext)
     recurcount -= 1;
 }
 
+#if 0
 unsigned int get_so_addr()
 {
     FILE *file = fopen("/proc/self/maps", "rt");
@@ -106,12 +107,10 @@ unsigned int get_so_addr()
     fclose(file);
     return addr;
 }
+#endif
 
 void init_trace_timer()
 {
-    g_so_address = get_so_addr();
-    nfd::Logger::TraceLine("so_addr: %x", g_so_address);
-
     struct sigaction sSigAction;
     struct sigaction sOldSigAction;
     struct itimerval sTimerValue;
