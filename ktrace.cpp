@@ -152,6 +152,10 @@ void stop_trace_timer()
 
 void show_backtrace (void* pvContext)
 {
+    int collected = (int)(g_cursor-g_buffer);
+    if(collected >= g_buffer_size)
+        return;
+
     unw_cursor_t cursor; unw_context_t uc;
     unw_word_t ip, sp, offp;
 
