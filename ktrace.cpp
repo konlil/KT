@@ -21,26 +21,43 @@
 namespace ktrace{
 
 LogHandler g_log;
-//#define LOG(...) {if(g_log) g_log(...)}
+//#define LOG(arg...) { if(g_log) g_log(arg); }
 
 int recurcount = 0;
 
-//#define MAX_DEPTH 128
-//#define MAX_TRACE 1024*200
-//struct BackTrace
-//{
-//    int depth;
-//    long callstack[MAX_DEPTH];
-//};
-
+int g_sample_interval = 0;
 int g_trace_cnt = 0;
-//BackTrace* g_traces = 0;
-
 unsigned char *g_buffer = 0;
 unsigned int g_buffer_size = 20*1024*1024;
 unsigned char *g_cursor = 0;
 
 unsigned int g_so_address = 0;
+
+size_t encodeVarint(int value, unsigned char* output)
+{
+    size_t outputSize = 0;
+    while(value > 127) {
+        output[outputSize] = ((unsigned char)(value & 127)) | 128;
+        value >>= 7;
+        outputSize ++;
+    }
+    output[outputSize++] = ((unsigned char)value)&127;
+    return outputSize;
+}
+
+int decodeVarint(unsigned char* input, size_t inputSize)
+{
+    int ret = 0;
+    for(size_t i=0; i<inputSize; ++i)
+    {
+        ret |= (input[i] & 127) << (7*i);
+        if(!(input[i]&128)) {
+            break;
+        }
+    }
+    return ret;
+}
+
 
 void show_backtrace(void*);
 
@@ -116,6 +133,8 @@ void start_trace_timer(int32_t interval_ms, int32_t max_timespan_sec)
     struct itimerval sTimerValue;
     struct itimerval sOldTimerValue;
 
+    g_sample_interval = interval_ms;
+
     sTimerValue.it_value.tv_sec = 1;
     sTimerValue.it_value.tv_usec = 0;
     sTimerValue.it_interval.tv_sec = 0;
@@ -128,6 +147,7 @@ void stop_trace_timer()
     struct itimerval sTimerValue;
     struct itimerval sOldTimerValue;
     memset(&sTimerValue, 0, sizeof(sTimerValue));
+    g_sample_interval = 0;
     setitimer(ITIMER_PROF, &sTimerValue, &sOldTimerValue);
 }
 
@@ -161,8 +181,7 @@ void show_backtrace (void* pvContext)
 
     //unw_getcontext(&uc);
     int result = unw_init_local(&cursor, &uc);
-    if(result != 0)
-    {
+    if(result != 0){
         return;
     }
 
@@ -170,23 +189,16 @@ void show_backtrace (void* pvContext)
 
     void* depth_ptr = (void*)g_cursor;
     g_cursor += 4;
-
-    //if(g_trace_cnt >= MAX_TRACE)
-    //    g_trace_cnt = 0;
-
-    //BackTrace& trace = g_traces[g_trace_cnt++];
-    //trace.depth = 0;
     int depth = 0;
     while (unw_step(&cursor) > 0)
     {
         //unw_get_proc_name(&cursor, name, 256, &offp);
         unw_get_reg(&cursor, UNW_REG_IP, &ip);
-        unw_get_reg(&cursor, UNW_REG_SP, &sp);
+        //unw_get_reg(&cursor, UNW_REG_SP, &sp);
 
         *((long*)g_cursor) = (long)ip;
         depth ++;
         g_cursor += sizeof(long);
-        //trace.callstack[trace.depth++] = (long)ip;
     }
     *((int*)depth_ptr) = depth;
 }
@@ -197,19 +209,29 @@ bool dump_trace2(const std::string& outname)
     if( fout == NULL )
         return false;
 
-    int tmp = 10;
-    fwrite(&tmp, sizeof(tmp), 1, fout);
-
+    fwrite(&g_sample_interval, sizeof(g_sample_interval), 1, fout);
     fwrite(&g_trace_cnt, sizeof(g_trace_cnt), 1, fout);
     fwrite(g_buffer, 1, (int)(g_cursor-g_buffer), fout);
 
-    char t[3] = {0};
-    fwrite(t, 1, 3, fout);
     FILE* fin = fopen("/proc/self/maps", "rt");
     if (fin == NULL)
         return false;
 
+    //7-bit encode file size
+    int lSize = 0;
     char buff[256] = {0};
+    while (fgets(buff, sizeof(buff), fin) != NULL)
+    {
+        lSize += strlen(buff);
+        memset(buff, 0, 256);
+    }
+    rewind(fin);
+    unsigned char eOut[8] = {0};
+    size_t eSize = encodeVarint(lSize, eOut);
+    fwrite(eOut, 1, eSize, fout);
+
+    //cat file 
+    memset(buff, 0, 256);
     while (fgets(buff, sizeof(buff), fin) != NULL)
     {
         fputs(buff, fout);
@@ -225,15 +247,6 @@ bool dump_trace(const std::string& outname)
     int fd = open(outname.c_str(), O_WRONLY|O_CREAT|O_TRUNC, S_IRUSR|S_IWUSR);
     if(fd == -1)
         return false;
-
-    /*for(auto& trace: g_traces)
-    {
-        write(fd, &(trace.depth), sizeof(trace.depth));
-        for(int i=0; i<trace.depth; ++i)
-        {
-            write(fd, trace.callstack+i, sizeof(long));
-        }
-    }*/
 
     static char tmp[64] = {0};
     sprintf(tmp, "addr: %x", g_so_address);
@@ -285,26 +298,17 @@ bool Start(int32_t interval_ms, int32_t max_timespan_sec)
     g_cursor = g_buffer;
     g_trace_cnt = 0;
     
-    /*if(g_traces) {
-        delete[] g_traces;
-        g_traces = 0;
-    }
-    long max_size = MAX_TRACE;
-    g_traces = new BackTrace[max_size];
-    */
-
     start_trace_timer(interval_ms, max_timespan_sec);
     return true;
 }
 
 bool Stop(const std::string& outname)
 {
+    if(g_buffer == NULL)
+        return false;
+
     stop_trace_timer();
     nfd::Logger::TraceLine("===Trace timer stopped.");
-
-    //std::string neox_root = ntk::ApkUtils::Instance().GetValue("string", "neox_root", "/sdcard/NeoX");
-    //std::string outfile = neox_root + "/gtrace.out";
-
     nfd::Logger::TraceLine("===Dump trace(%d samples) to: %s\n", g_trace_cnt, outname.c_str());
     //bool rtn = dump_trace(outname);
     bool rtn = dump_trace2(outname);
