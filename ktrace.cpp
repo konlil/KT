@@ -17,21 +17,31 @@
 
 #include "foundation.h"
 #include "ktrace.h"
+#include "common/platform/system.h"
 
 namespace ktrace{
 
 LogHandler g_log;
 //#define LOG(arg...) { if(g_log) g_log(arg); }
 
+#define MAX_DEPTH 255
+
 int recurcount = 0;
 
 int g_sample_interval = 0;
-int g_trace_cnt = 0;
+volatile int g_trace_cnt = 0;
 unsigned char *g_buffer = 0;
 unsigned int g_buffer_size = 20*1024*1024;
 unsigned char *g_cursor = 0;
 
-unsigned int g_so_address = 0;
+unsigned int g_start_time = 0;
+
+struct TimeoutMarker
+{
+    int trace_cnt;      //trace的顺序号
+    unsigned int timeout_value; //超时值
+};
+std::vector<TimeoutMarker> g_timeout_markers;
 
 size_t encodeVarint(int value, unsigned char* output)
 {
@@ -111,6 +121,7 @@ unsigned int get_so_addr()
 
 void init_trace_timer()
 {
+    /*
     struct sigaction sSigAction;
     struct sigaction sOldSigAction;
     struct itimerval sTimerValue;
@@ -119,7 +130,7 @@ void init_trace_timer()
     sSigAction.sa_sigaction = mySigAction;
     sigemptyset(&sSigAction.sa_mask);
     sigaction(SIGPROF, &sSigAction, &sOldSigAction);
-    /*sTimerValue.it_value.tv_sec = 0;
+    sTimerValue.it_value.tv_sec = 0;
     sTimerValue.it_value.tv_usec = 1000;
     sTimerValue.it_interval.tv_sec = 0;
     sTimerValue.it_interval.tv_usec = 50000;
@@ -127,13 +138,19 @@ void init_trace_timer()
     */
 }
 
-void start_trace_timer(int32_t interval_ms, int32_t max_timespan_sec)
+void start_trace_timer(int32_t interval_ms)
 {
+    g_sample_interval = interval_ms;
+
+    struct sigaction sSigAction;
+    struct sigaction sOldSigAction;
     struct itimerval sTimerValue;
     struct itimerval sOldTimerValue;
 
-    g_sample_interval = interval_ms;
-
+    sSigAction.sa_flags = SA_RESTART | SA_SIGINFO;
+    sSigAction.sa_sigaction = mySigAction;
+    sigemptyset(&sSigAction.sa_mask);
+    sigaction(SIGPROF, &sSigAction, &sOldSigAction);
     sTimerValue.it_value.tv_sec = 1;
     sTimerValue.it_value.tv_usec = 0;
     sTimerValue.it_interval.tv_sec = 0;
@@ -192,7 +209,7 @@ void show_backtrace (void* pvContext)
     void* depth_ptr = (void*)g_cursor;
     g_cursor += 4;
     int depth = 0;
-    while (unw_step(&cursor) > 0)
+    while (unw_step(&cursor) > 0 && depth < MAX_DEPTH)
     {
         //unw_get_proc_name(&cursor, name, 256, &offp);
         unw_get_reg(&cursor, UNW_REG_IP, &ip);
@@ -201,7 +218,7 @@ void show_backtrace (void* pvContext)
         *((long*)g_cursor) = (long)ip;
         depth ++;
         g_cursor += sizeof(long);
-    }
+   }
     *((int*)depth_ptr) = depth;
 }
 
@@ -210,9 +227,10 @@ bool dump_trace2(const std::string& outname)
     FILE* fout = fopen(outname.c_str(), "wb");
     if( fout == NULL )
         return false;
-
+    
+    int total_trace = g_trace_cnt;
     fwrite(&g_sample_interval, sizeof(g_sample_interval), 1, fout);
-    fwrite(&g_trace_cnt, sizeof(g_trace_cnt), 1, fout);
+    fwrite(&total_trace, sizeof(total_trace), 1, fout);
     fwrite(g_buffer, 1, (int)(g_cursor-g_buffer), fout);
 
     FILE* fin = fopen("/proc/self/maps", "rt");
@@ -239,6 +257,31 @@ bool dump_trace2(const std::string& outname)
         fputs(buff, fout);
     }
     fclose(fin);
+    fclose(fout);
+    return true;
+}
+
+bool dump_timeout_markers(const std::string& outname)
+{
+    if(g_timeout_markers.size() <= 0)
+        return false;
+    
+    FILE* fout = fopen(outname.c_str(), "wb");
+    if( fout == NULL )
+        return false;
+    
+    //write time interval
+    unsigned int time_interval = (unsigned int)neox::PITime() - g_start_time;
+    fwrite(&time_interval, sizeof(unsigned int), 1, fout);
+
+    int lSize = g_timeout_markers.size();
+    fwrite(&lSize, sizeof(int), 1, fout);
+    for(int i=0; i<lSize; ++i)
+    {
+        TimeoutMarker& m = g_timeout_markers[i];
+        fwrite(&m.trace_cnt, sizeof(int), 1, fout);
+        fwrite(&m.timeout_value, sizeof(unsigned int), 1, fout);
+    }
     fclose(fout);
     return true;
 }
@@ -281,6 +324,15 @@ bool dump_trace(const std::string& outname)
 
 bool Start(int32_t interval_ms, int32_t max_timespan_sec)
 {
+    //re-allocate buffer if size changed
+    if(max_timespan_sec > 0 && g_buffer_size != max_timespan_sec*1024*1024){
+        g_buffer_size = max_timespan_sec*1024*1024;
+        if(g_buffer != NULL){
+            free(g_buffer);
+            g_buffer = NULL;
+        }
+    }
+        
     if(g_buffer == NULL && g_buffer_size > 0)
     {
         int i=5;
@@ -300,7 +352,10 @@ bool Start(int32_t interval_ms, int32_t max_timespan_sec)
     g_cursor = g_buffer;
     g_trace_cnt = 0;
     
-    start_trace_timer(interval_ms, max_timespan_sec);
+    g_timeout_markers.clear();
+    
+    g_start_time = (unsigned int)neox::PITime();
+    start_trace_timer(interval_ms);
     return true;
 }
 
@@ -314,8 +369,15 @@ bool Stop(const std::string& outname)
     nfd::Logger::TraceLine("===Dump trace(%d samples) to: %s\n", g_trace_cnt, outname.c_str());
     //bool rtn = dump_trace(outname);
     bool rtn = dump_trace2(outname);
+    dump_timeout_markers(outname + ".mk");
     nfd::Logger::TraceLine("===Dump done.");
     return rtn;
+}
+
+void MarkTimeout(uint32_t timeout_v)
+{
+    TimeoutMarker marker({g_trace_cnt, timeout_v});
+    g_timeout_markers.push_back(marker);
 }
 
 void SetLogHandler(LogHandler log_handler)
